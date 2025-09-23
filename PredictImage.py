@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import json
 import cv2
 from scipy.spatial import cKDTree
-from scipy.optimize import minimize
+from scipy.optimize import minimize, least_squares
 import os
 
 
@@ -347,7 +347,6 @@ def draw_projection(image_points, labels, K, img=None):
 
 
 
-
 def simulate_fisheye_view(json_path, camera_index, K, D, delta_pitch_deg=15.0, delta_yaw_deg=5.0, delta_roll_deg=0.0, delta_r=0.0, return_points_only=False, excluded_pmts=[]):
     #print('simulate_fisheye_view camera_index=',camera_index)
     geo = load_geometry(json_path)
@@ -405,9 +404,54 @@ def match_leds_to_blobs(sim_points, blob_points, labels, threshold=100):
 
 
 # In[8]:
+from shapely.geometry import Polygon
+
+def polygon_penalty(mPMT_groups, sim_groups, area_weight=1.0):
+    penalty = 0.0
+    polygons = {}
+
+    for mPMT_id, sim_pts in sim_groups.items():
+        if len(sim_pts) < 3:
+            continue
+
+        # Expected polygon from simulated LED positions
+        sim_sorted = sorted(sim_pts, key=lambda p: int(p[2].split('-')[1]))
+        sim_coords = [(x, y) for x, y, _ in sim_sorted]
+        sim_poly = Polygon(sim_coords)
+        expected_area = sim_poly.area
+
+        # Matched polygon (if any points matched)
+        if mPMT_id in mPMT_groups and len(mPMT_groups[mPMT_id]) >= 3:
+            pts_sorted = sorted(mPMT_groups[mPMT_id], key=lambda p: int(p[2].split('-')[1]))
+            coords = [(x, y) for x, y, _ in pts_sorted]
+            blob_poly = Polygon(coords)
+
+            # Self-intersection check
+            if not blob_poly.is_valid:
+                penalty += 5000.0
+
+            polygons[mPMT_id] = blob_poly
+
+            # Area difference penalty
+            area_diff = abs(blob_poly.area - expected_area)
+            penalty += area_weight * (area_diff / (expected_area + 1e-6))
+        else:
+            # No polygon possible (too few matches) → big penalty
+            penalty += area_weight * expected_area
+
+    # Penalize overlaps between polygons
+    ids = list(polygons.keys())
+    for i in range(len(ids)):
+        for j in range(i+1, len(ids)):
+            if polygons[ids[i]].intersects(polygons[ids[j]]):
+                inter_area = polygons[ids[i]].intersection(polygons[ids[j]]).area
+                penalty += 1000.0 * inter_area
+
+    return penalty
 
 
-def chisquare(simulated_points, blob_points, labels=None, match_threshold=200.0, sigma_pix = 20.0):
+
+def chisquare(simulated_points, blob_points, labels=None, match_threshold=300.0, sigma_pix = 10.0, control_points={}, polygon_weight=100.0 ):
      # Build label -> point dictionary safely
     label_to_sim = {label: pt for pt, label in zip(simulated_points, labels)}
 
@@ -424,7 +468,8 @@ def chisquare(simulated_points, blob_points, labels=None, match_threshold=200.0,
 
     # Compute chi² sum over matched points
     chi2 = 0.0
-    for (x, y, label) in matches:
+    for (label, x, y) in matches:
+        #print('chi2 calc: x,y,label=',x,y,label)
         if label not in label_to_sim:
             continue # skip unmatched??? should I add a penalty?
         sx, sy = label_to_sim[label]
@@ -434,7 +479,7 @@ def chisquare(simulated_points, blob_points, labels=None, match_threshold=200.0,
 
     # Penalize missed matches (LEDs with no match)
     n_matched = len(matches)
-    missed_penalty = 1000.0 * (len(simulated_points) - n_matched)
+    missed_penalty = 10.0 * (len(simulated_points) - n_matched)
     chi2 += missed_penalty
 
     # Optional: penalize unmatched blobs
@@ -442,57 +487,170 @@ def chisquare(simulated_points, blob_points, labels=None, match_threshold=200.0,
     # unmatched_blobs = set(range(len(blob_points))) - set(matched_blob_indices)
     # chi2 += 5.0 * len(unmatched_blobs)
 
+    # --- Polygon penalties ---
+    # Build per-mPMT groups of matched blobs
+    mPMT_groups = {}
+    for (label, x, y) in matches:
+        #print('x,y,label=',x,y,label)
+        mPMT_id = label.split('-')[0]  # e.g. "003"
+        mPMT_groups.setdefault(mPMT_id, []).append((x, y, label))
+
+    sim_groups = {}
+    for (sx, sy), label in zip(simulated_points, labels):
+        mPMT_id = str(label).split('-')[0]
+        sim_groups.setdefault(mPMT_id, []).append((sx, sy, str(label)))
+    
+    chi2 += polygon_weight * polygon_penalty(mPMT_groups, sim_groups)
+
+    control_weight = 1.0e8  # very strong penalty
+    for label, (cx, cy) in control_points.items():
+        # Try to find a matched blob with this label
+        matched = [ (x, y) for l, x, y in matches if l == label ]
+        if matched:
+            x, y = matched[0]
+            dx = cx - x
+            dy = cy - y
+            chi2 += control_weight * (dx**2 + dy**2) / sigma_pix**2
+        else:
+            # If no match, apply severe penalty
+            chi2 += control_weight**2
+            
     return chi2
 
 
+def chisquare_residuals_fixed(sim_points, sim_labels,
+                              blob_points, all_labels,
+                              match_threshold=300.0, sigma_pix=10.0,
+                              control_points={}):
+    """
+    Fixed-length residuals for least_squares LM.
+    
+    Args:
+        sim_points: simulated points (Nx2)
+        sim_labels: labels corresponding to sim_points
+        blob_points: detected blobs (Mx2)
+        all_labels: fixed list of all possible LED labels for this camera
+        match_threshold: max distance for matching
+        sigma_pix: scaling for residuals
+        control_points: dict of control points {label: (x, y)}
+        
+    Returns:
+        residuals: 1D array of length 2*len(all_labels) + 2*len(control_points)
+    """
+    N_leds = len(all_labels)
+    residuals = np.zeros(2*N_leds + 2*len(control_points), dtype=np.float64)
 
-def match_blobs(blobs, json_path, camera_index, K, D, initial_guess=None, excluded_pmts=[], bounds = [
-        (-20, 20),   # delta_pitch_deg
-        (-5, 5),   # delta_yaw_deg
-        (-5, 5),   # delta_roll_deg
-       (-0.01, 0.01), # delta_r in meters
-        (0.082, 0.086), # k1 [ 0.05003216 -0.04567757  0.06960187 -0.03096402]
-        (0.007, 0.009), # k2
-        (0.0005, 0.0008), # k3
-        (0.0001, 0.0002)   ] ):
+    # --- Match LEDs to blobs ---
+    matches = match_leds_to_blobs(sim_points, blob_points, sim_labels,
+                                  threshold=match_threshold)
+    matched_dict = {label: (x, y) for label, x, y in matches}
+    sim_dict     = {label: tuple(pt) for pt, label in zip(sim_points, sim_labels)}
+
+    # --- Residuals for all LEDs ---
+    for i, label in enumerate(all_labels):
+        if label in sim_dict and label in matched_dict:
+            sx, sy = sim_dict[label]
+            x, y   = matched_dict[label]
+            dx = (sx - x) / sigma_pix
+            dy = (sy - y) / sigma_pix
+        else:
+            # missing sim point or unmatched blob => large penalty
+            dx = dy = 100.0
+        residuals[2*i]   = dx
+        residuals[2*i+1] = dy
+
+    # --- Residuals for control points ---
+    for j, (label, (cx, cy)) in enumerate(control_points.items()):
+        idx = 2*N_leds + 2*j
+        dx = dy = 0.0
+
+        # Penalize distance to matched blob if exists
+        if label in matched_dict:
+            x, y = matched_dict[label]
+            dx += (cx - x) / sigma_pix
+            dy += (cy - y) / sigma_pix
+        else:
+            dx += 100.0
+            dy += 100.0
+
+        # Penalize distance to simulated point if exists
+        if label in sim_dict:
+            sx, sy = sim_dict[label]
+            dx += (cx - sx) / sigma_pix
+            dy += (cy - sy) / sigma_pix
+        else:
+            dx += 10.0 / sigma_pix
+            dy += 10.0 / sigma_pix
+
+        residuals[idx]   = dx
+        residuals[idx+1] = dy
+
+    return residuals
+
+
+
+
+
+def match_blobs(blobs, json_path, camera_index, K, D, initial_guess=None,
+                excluded_pmts={}, bounds=None, control_points={},
+                use_lm=False):
+
     blob_points = np.array([b.pt for b in blobs], dtype=np.float32)
 
     if initial_guess is None:
-        initial_guess = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # pitch, yaw, roll
+        initial_guess = [0.0]*8  # pitch, yaw, roll, r, k1..k4
 
     match_threshold = 1000
-    # Set reasonable bounds for each parameter:
+
+    geo = load_geometry(json_path)
     
     def objective(params):
-        delta_pitch_deg, delta_yaw_deg, delta_roll_deg, delta_r, k1, k2, k3, k4 = params
-        D_fit = np.array([k1, k2, k3, k4], dtype=np.float64)
-        fitpars = {
-            'delta_pitch_deg': delta_pitch_deg,
-            'delta_yaw_deg': delta_yaw_deg,
-            'delta_roll_deg': delta_roll_deg,
-            'delta_r': delta_r,  
-            'D_fit': D_fit
-        }
         sim_points, labels_valid = simulate_fisheye_view(
             json_path=json_path,
             camera_index=camera_index,
             K=K,
-            D=D_fit,
-            delta_pitch_deg=fitpars['delta_pitch_deg'],
-            delta_yaw_deg=fitpars['delta_yaw_deg'],
-            delta_roll_deg=fitpars['delta_roll_deg'],
-            delta_r=fitpars['delta_r'],
+            D=np.array(params[4:], dtype=np.float64),
+            delta_pitch_deg=params[0],
+            delta_yaw_deg=params[1],
+            delta_roll_deg=params[2],
+            delta_r=params[3],
             return_points_only=True,
             excluded_pmts=excluded_pmts
         )
-        return chisquare(sim_points, blob_points, labels_valid, match_threshold)
+        return chisquare(sim_points, blob_points, labels_valid,
+                         match_threshold, 20.0, control_points)
 
-    result = minimize(objective, initial_guess, method='Powell', bounds=bounds )
+    if use_lm:
+        def residuals(params):
+            sim_points, labels_valid = simulate_fisheye_view(
+                json_path=json_path,
+                camera_index=camera_index,
+                K=K,
+                D=np.array(params[4:], dtype=np.float64),
+                delta_pitch_deg=params[0],
+                delta_yaw_deg=params[1],
+                delta_roll_deg=params[2],
+                delta_r=params[3],
+                return_points_only=True,
+                excluded_pmts=excluded_pmts
+            )
+            leds_all, labels_all, num_pmts_all = select_leds(geo)
 
-    # Final LED positions with best-fit params
-    best_params = result.x
-    D_fit = np.array( [best_params[4],best_params[5],best_params[6],best_params[7] ] )
-    
+            return chisquare_residuals_fixed(sim_points, labels_valid, blob_points, labels_all,
+                                       match_threshold, 20.0, control_points)
+
+        result = least_squares(residuals, initial_guess, method='lm', max_nfev=20000)
+        best_params = result.x
+        chi2 = np.sum(result.fun**2)
+        success = result.success
+    else:
+        result = minimize(objective, initial_guess, method='Powell', bounds=bounds)
+        best_params = result.x
+        chi2 = result.fun
+        success = result.success
+
+    # Final simulation with best-fit
+    D_fit = np.array(best_params[4:])
     sim_points, labels_valid = simulate_fisheye_view(
         json_path=json_path,
         camera_index=camera_index,
@@ -501,33 +659,40 @@ def match_blobs(blobs, json_path, camera_index, K, D, initial_guess=None, exclud
         delta_pitch_deg=best_params[0],
         delta_yaw_deg=best_params[1],
         delta_roll_deg=best_params[2],
-        delta_r=best_params[3], #fixed
-        return_points_only=True
+        delta_r=best_params[3],
+        return_points_only=True,
+        excluded_pmts=excluded_pmts
     )
 
-    # Match again with best-fit for output
-    matches = match_leds_to_blobs(sim_points, blob_points, labels_valid, threshold=match_threshold)
+    # Match again with best-fit
+    matches = match_leds_to_blobs(sim_points, blob_points, labels_valid,
+                                  threshold=match_threshold)
 
     return matches, {
         'delta_pitch_deg': best_params[0],
         'delta_yaw_deg': best_params[1],
         'delta_roll_deg': best_params[2],
-        'delta_r': best_params[3], #fixed
-        'D_fit':D_fit,
-        'chi2': result.fun,
-        'success': result.success
+        'delta_r': best_params[3],
+        'D_fit': D_fit,
+        'chi2': chi2,
+        'success': success
     }
+
 
 
 # In[11]:
 
 
-def run_blob_detector(image_file_name, minarea=40, maxarea=1000, minthres=40, maxthres=255 ):
+def run_blob_detector(camera_index, image_file_name, minarea=40, maxarea=1000, minthres=40, maxthres=255 ):
     # Load grayscale image
     img = cv2.imread(image_file_name, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Could not load image: {image_file_name}")
 
+    # Flip?
+    if camera_index>=4:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+    
     processed_image = cv2.bilateralFilter(np.array(img), 5, 75, 75)
     
     # Set up detector parameters
@@ -576,12 +741,16 @@ def filter_blobs_by_distance(blobs, min_distance=1):
 
 
 
-def draw_image_with_blobs_save(image_file_name, blobs, output_file_name):
+def draw_image_with_blobs_save(camera_index, image_file_name, blobs, output_file_name):
     # Load the original image (color)
     img = cv2.imread(image_file_name)
     if img is None:
         raise FileNotFoundError(f"Could not load image: {image_file_name}")
 
+    # Flip?
+    if camera_index>=4:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+        
     # Draw blobs (yellow hollow circles)
     for b in blobs:
         x, y = int(b.pt[0]), int(b.pt[1])
@@ -598,7 +767,10 @@ def visualize_all_leds_and_matches(
     output_filename="blob_match_overlay.png",
     font_scale=1.5,
     thickness=2,
-    excluded_pmts=[]):
+    excluded_pmts=[],
+    control_points={},
+    overlay_image_name=None,
+    alpha=0.5 ):
     """
     Visualize all simulated LEDs and matched blobs on the image.
     Saves the image to `output_filename` and prints the filename.
@@ -620,6 +792,10 @@ def visualize_all_leds_and_matches(
     if img is None:
         raise FileNotFoundError(f"Could not load image {image_filename}")
 
+    # Flip?
+    if camera_index>=4:
+        img = cv2.rotate(img, cv2.ROTATE_180)
+    
     # Extract blob points as (int x, int y)
     blob_points = [(int(b.pt[0]), int(b.pt[1]), b.size) for b in blobs]
 
@@ -659,6 +835,42 @@ def visualize_all_leds_and_matches(
         cv2.putText(img, label, (mx_i + 5, my_i + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), thickness)
 
+
+    # --- Draw control points ---
+    for label, (cx, cy) in control_points.items():
+        # Draw a circle at the control point
+        cv2.circle(
+            img,                     # the image array
+            (int(cx), int(cy)),        # position
+            radius=20,                  # circle radius
+            color=(255, 0, 255),       # magenta color (BGR)
+            thickness=3               # 
+        )
+        # Put the label text near the control point
+        cv2.putText(
+            img,
+            str(label),
+            (int(cx) + 10, int(cy) - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (255, 0, 255),
+            thickness
+        )
+
+    # --- Optional overlay ---
+    if overlay_image_name is not None:
+        overlay_img = cv2.imread(overlay_image_name)
+        if overlay_img is not None:
+            # Flip for upside-down cameras
+            if camera_index >= 4:
+                overlay_img = cv2.rotate(overlay_img, cv2.ROTATE_180)
+            # Resize overlay to match base image if needed
+            #if overlay_img.shape[:2] != img.shape[:2]:
+            #    overlay_img = cv2.resize(overlay_img, (img.shape[1], img.shape[0]))
+            # Apply transparency
+            img = cv2.addWeighted(img, 1.0 - alpha, overlay_img, alpha, 0)
+        else:
+            print(f"Warning: Could not load overlay image {overlay_img_name}")
     # Save and print filename
     cv2.imwrite(output_filename, img)
     print(f"Overlay image saved to: {output_filename}")
@@ -776,3 +988,6 @@ def save_matching_results_to_json(
         json.dump(results, f, indent=4)
 
     print(f"Saved results to {output_filename}")
+
+
+
