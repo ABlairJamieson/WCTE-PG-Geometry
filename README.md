@@ -179,5 +179,19 @@ This module provides **bundle adjustment routines** specialized for fisheye came
  
 Here is an example of the output so far.  Some additional work needs to be done on the inputs to improve the matching for some of the LEDs.
 
+<img width="1500" height="1200" alt="wcte_3d_fit_result_07102025" src="https://github.com/user-attachments/assets/e584d7b9-2fd8-4e55-a8ad-291befec10a1" />
 
-[wcte_3d_fit_result_07102025-initialresult.pdf](https://github.com/user-attachments/files/22962250/wcte_3d_fit_result_07102025-initialresult.pdf)
+
+> **Note / Warning**
+>
+> - This code has been tested with **SciPy ≥ 1.16.0**. Older versions may raise warnings or fail due to changes in `scipy.optimize.least_squares` handling of bounds, Jacobians, or parallel workers.
+> - **SciPy 1.16.0** was released on **June 22, 2025**, and is compatible with **Python 3.11** and **3.12**. For more details, refer to the [SciPy 1.16.0 release notes](https://docs.scipy.org/doc/scipy/release/1.16.0-notes.html).
+> - By default, bundle adjustment uses multiple workers (`nworkers`) for parallel residual evaluation. To **run serially**, set `nworkers=1` or comment out the `nworkers` argument in the call to `least_squares` inside `bundle_fisheye_ba.py`.
+>   ```python
+>   # Original (parallel):
+>   result = least_squares(residuals_func, x0, bounds=bounds, workers=nworkers)
+>
+>   # Serial version:
+>   result = least_squares(residuals_func, x0, bounds=bounds)  # single-threaded
+>   ```
+> - This can help debug issues or run on systems without multiprocessing support.
